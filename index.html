@@ -143,34 +143,37 @@
     const starField = new THREE.Points(starsGeo, starsMat);
     scene.add(starField);
 
-    // Load Earth 3D Model
-    let earthModel = null;
-    const loader = new THREE.GLTFLoader();
+    // --- Create Earth Sphere without needing an external .glb file ---
+    let earthModel = new THREE.Group();
 
-    loader.load(
-      'earth.glb',
-      (gltf) => {
-        earthModel = gltf.scene;
-        
-        // Auto-center and normalize scale if necessary
-        const box = new THREE.Box3().setFromObject(earthModel);
-        const size = box.getSize(new THREE.Vector3());
-        const maxDim = Math.max(size.x, size.y, size.z);
-        if (maxDim > 0) {
-          const targetScale = 2.5 / maxDim;
-          earthModel.scale.setScalar(targetScale);
-        }
+    // 1. Create Sphere Geometry
+    const geometry = new THREE.SphereGeometry(1.5, 64, 64);
 
-        scene.add(earthModel);
-        statusEl.innerText = 'Hand Tracking Active';
+    // 2. Load High-Res Earth Texture
+    const textureLoader = new THREE.TextureLoader();
+    const earthTexture = textureLoader.load(
+      'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_atmos_2048.jpg',
+      () => {
+        statusEl.innerText = 'Earth Loaded - Hand Tracking Active';
       },
       undefined,
-      (error) => {
-        console.error('Error loading earth.glb:', error);
-        statusEl.innerText = 'Error loading earth.glb file';
+      (err) => {
+        console.error('Texture load error:', err);
+        statusEl.innerText = 'Failed to load Earth texture';
       }
     );
 
+    // 3. Create Material
+    const material = new THREE.MeshStandardMaterial({
+      map: earthTexture,
+      roughness: 0.7,
+      metalness: 0.1
+    });
+
+    // 4. Create Mesh & Add to Scene
+    const earthMesh = new THREE.Mesh(geometry, material);
+    earthModel.add(earthMesh);
+    scene.add(earthModel);
     // Linear interpolation for smooth hand tracking transitions
     let targetRotationY = 0;
     let targetRotationX = 0;
