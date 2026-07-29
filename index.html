@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Hand-Controlled 3D Earth</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body, html {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      touch-action: none; /* Disable native touch gestures */
+    }
+
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 1;
+    }
+
+    /* Video feed (hidden, used purely for tracking pipeline) */
+    #webcam {
+      display: none;
+    }
+
+    /* UI Overlay */
+    #ui-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 10;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      align-items: center;
+      padding: 20px;
+    }
+
+    .instruction-card {
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #ffffff;
+      padding: 14px 24px;
+      border-radius: 30px;
+      font-size: 1.05rem;
+      font-weight: 500;
+      letter-spacing: 0.3px;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+      text-align: center;
+      animation: pulse 2s infinite ease-in-out;
+    }
+
+    .status-badge {
+      background: rgba(0, 0, 0, 0.6);
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      margin-bottom: 10px;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 0.9; transform: scale(1); }
+      50% { opacity: 1; transform: scale(1.02); }
+    }
+  </style>
+
+  <!-- Three.js & GLTFLoader CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+  <!-- Google MediaPipe Hands & Camera Utils CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <div id="canvas-container"></div>
+  <video id="webcam" playsinline></video>
+
+  <div id="ui-overlay">
+    <div class="instruction-card">
+      Move your hand to control Earth
+    </div>
+    <div id="status" class="status-badge">Starting camera...</div>
+  </div>
+
+  <script>
+    // --- 1. Three.js Setup ---
+    const container = document.getElementById('canvas-container');
+    const statusEl = document.getElementById('status');
+
+    const scene = new THREE.Scene();
+    
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    const initialCamZ = 6;
+    camera.position.z = initialCamZ;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    container.appendChild(renderer.domElement);
+
+    // Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(5, 3, 5);
+    scene.add(dirLight);
+
+    // Stars background
+    const starsGeo = new THREE.BufferGeometry();
+    const starsCount = 1500;
+    const starPositions = new Float32Array(starsCount * 3);
+    for (let i = 0; i < starsCount * 3; i++) {
+      starPositions[i] = (Math.random() - 0.5) * 100;
+    }
+    starsGeo.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+    const starsMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.2 });
+    const starField = new THREE.Points(starsGeo, starsMat);
+    scene.add(starField);
+
+    // Load Earth 3D Model
+    let earthModel = null;
+    const loader = new THREE.GLTFLoader();
+
+    loader.load(
+      'earth.glb',
+      (gltf) => {
+        earthModel = gltf.scene;
+        
+        // Auto-center and normalize scale if necessary
+        const box = new THREE.Box3().setFromObject(earthModel);
+        const size = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+        if (maxDim > 0) {
+          const targetScale = 2.5 / maxDim;
+          earthModel.scale.setScalar(targetScale);
+        }
+
+        scene.add(earthModel);
+        statusEl.innerText = 'Hand Tracking Active';
+      },
+      undefined,
+      (error) => {
+        console.error('Error loading earth.glb:', error);
+        statusEl.innerText = 'Error loading earth.glb file';
+      }
+    );
+
+    // Linear interpolation for smooth hand tracking transitions
+    let targetRotationY = 0;
+    let targetRotationX = 0;
+    let targetZoomZ = initialCamZ;
+
+    // --- 2. MediaPipe Hands Setup ---
+    const videoElement = document.getElementById('webcam');
+
+    function onResults(results) {
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        statusEl.innerText = 'Hand Detected';
+        const landmarks = results.multiHandLandmarks[0];
+
+        // 1. Hand Movement (Index Finger Tip / Landmark 8 or Wrist / Landmark 0)
+        // MediaPipe X is [0, 1] left to right. Invert for natural mirrored movement.
+        const handX = 1 - landmarks[9].x; 
+        const handY = landmarks[9].y;     // [0, 1] top to bottom
+
+        // Map Hand X to 360-degree Y-axis rotation (-PI to +PI)
+        targetRotationY = (handX - 0.5) * Math.PI * 2;
+
+        // Map Hand Y to X-axis tilt angle (-60 deg to +60 deg)
+        targetRotationX = (handY - 0.5) * (Math.PI * 0.66);
+
+        // 2. Pinch Gesture (Distance between Thumb tip #4 and Index tip #8)
+        const thumbTip = landmarks[4];
+        const indexTip = landmarks[8];
+
+        const pinchDist = Math.hypot(
+          thumbTip.x - indexTip.x,
+          thumbTip.y - indexTip.y,
+          thumbTip.z - indexTip.z
+        );
+
+        // Map pinch distance (approx 0.02 closed to 0.25 open) to Camera Z position
+        // Closer fingers = Zoom In (smaller Z), Open fingers = Zoom Out (larger Z)
+        const minZ = 3.2;  // Maximum zoom in
+        const maxZ = 9.0;  // Maximum zoom out
+        
+        // Normalize pinch distance between 0.03 and 0.20
+        const clampedPinch = Math.max(0.03, Math.min(0.20, pinchDist));
+        const normalizedPinch = (clampedPinch - 0.03) / (0.20 - 0.03);
+
+        targetZoomZ = minZ + normalizedPinch * (maxZ - minZ);
+      } else {
+        statusEl.innerText = 'Looking for hand...';
+      }
+    }
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+
+    hands.onResults(onResults);
+
+    // Request Webcam Access
+    const cameraUtils = new Camera(videoElement, {
+      onFrame: async () => {
+        await hands.send({ image: videoElement });
+      },
+      width: 640,
+      height: 480
+    });
+
+    cameraUtils.start().catch((err) => {
+      console.error("Camera access failed:", err);
+      statusEl.innerText = "Camera permission denied";
+    });
+
+    // --- 3. Animation Loop ---
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (earthModel) {
+        // Smoothly interpolate current rotations and camera zoom
+        earthModel.rotation.y += (targetRotationY - earthModel.rotation.y) * 0.08;
+        earthModel.rotation.x += (targetRotationX - earthModel.rotation.x) * 0.08;
+      }
+
+      camera.position.z += (targetZoomZ - camera.position.z) * 0.08;
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // --- 4. Responsive Resize ---
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+  </html>
